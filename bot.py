@@ -10,7 +10,8 @@ import json
 import logging
 import os
 import random
-import shlex
+import subprocess
+import tempfile
 import sys
 import time
 import re
@@ -69,10 +70,7 @@ COOKIES_FILE = COOKIES_FILE or _cookies_from_env()
 if COOKIES_FILE:
     YDL_BASE["cookiefile"] = COOKIES_FILE
 
-FFMPEG_OPTS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn -loglevel warning",
-}
+FFMPEG_OPTS = {"options": "-vn -loglevel warning"}
 
 
 # ---------------------------------------------------------------- data
@@ -225,13 +223,29 @@ async def resolve_spotify(query: str) -> list[dict]:
     return parse_spotify_embed(html)
 
 
-def _stream_url(page_url: str) -> tuple[str, dict]:
+def _resolve(page_url: str) -> dict:
+    """Full metadata for one video (or the first search hit), JSON-safe."""
     opts = {**YDL_BASE, "noplaylist": True}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(page_url, download=False)
-    if "entries" in info:
-        info = info["entries"][0]
-    return info["url"], info
+        if "entries" in info:
+            info = next(e for e in info["entries"] if e)
+        return ydl.sanitize_info(info)
+
+
+def _open_audio(info: dict, errlog) -> tuple[subprocess.Popen, str]:
+    """Start yt-dlp downloading the audio to stdout. yt-dlp fetches in small
+    chunks with the right headers/cookies, which YouTube accepts from servers
+    far more often than one big FFmpeg request."""
+    fd, info_path = tempfile.mkstemp(suffix=".info.json")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(info, f)
+    cmd = [sys.executable, "-m", "yt_dlp", "--load-info-json", info_path,
+           "-f", "bestaudio/best", "-o", "-", "--quiet", "--no-warnings", "--no-part"]
+    if COOKIES_FILE:
+        cmd += ["--cookies", COOKIES_FILE]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errlog)
+    return proc, info_path
 
 
 # ---------------------------------------------------------------- bot
@@ -284,39 +298,46 @@ class MusicBot(discord.Client):
         self.cancel_idle_timer(p)
 
         try:
-            stream, info = await asyncio.to_thread(_stream_url, nxt.url)
+            info = await asyncio.to_thread(_resolve, nxt.url)
         except Exception as e:
             log.warning("Failed to resolve %s: %s", nxt.url, e)
             if p.text_channel:
-                await p.text_channel.send(f"⚠️ Couldn't play {nxt.label()} — skipping.")
+                reason = str(e).replace("ERROR: ", "").split("\n")[0][:300]
+                await p.text_channel.send(f"⚠️ Couldn't play {nxt.label()} — skipping.\n-# {reason}")
             p.current = None
             return await self.play_next(guild)
 
         if nxt.duration is None:
             nxt.duration = info.get("duration")
         nxt.page = info.get("webpage_url") or nxt.page
+        log.info("Streaming %s", nxt.page)
 
-        # YouTube's media servers expect the same headers yt-dlp used, or they return 403
-        before = FFMPEG_OPTS["before_options"]
-        headers = info.get("http_headers") or {}
-        if headers:
-            before += " -headers " + shlex.quote("".join(f"{k}: {v}\r\n" for k, v in headers.items()))
-        log.info("Streaming %s (format %s)", info.get("webpage_url"), info.get("format_id"))
-        ffmpeg = discord.FFmpegPCMAudio(stream, before_options=before,
-                                        options=FFMPEG_OPTS["options"], stderr=sys.stderr)
+        errlog = tempfile.TemporaryFile()
+        proc, info_path = _open_audio(info, errlog)
+        ffmpeg = discord.FFmpegPCMAudio(proc.stdout, pipe=True,
+                                        options=FFMPEG_OPTS["options"], stderr=errlog)
         source = discord.PCMVolumeTransformer(ffmpeg, volume=p.volume)
         started = time.monotonic()
 
         def after(err):
+            if proc.poll() is None:
+                proc.kill()
+            try:
+                os.remove(info_path)
+            except OSError:
+                pass
+            errlog.seek(0)
+            errors = errlog.read().decode("utf-8", "replace").strip()
+            errlog.close()
             if err:
                 log.error("Player error: %s", err)
+            if errors:
+                log.warning("Stream errors for %s:\n%s", nxt.page, errors[-2000:])
             elapsed = time.monotonic() - started
-            if elapsed < 3 and (nxt.duration or 0) > 10:
-                log.error("Track ended after %.1fs - FFmpeg likely couldn't read the stream (see errors above)", elapsed)
-                if p.text_channel:
-                    asyncio.run_coroutine_threadsafe(
-                        p.text_channel.send(f"⚠️ {nxt.label()} stopped right away — YouTube may be blocking the server."),
-                        self.loop)
+            if elapsed < 3 and (nxt.duration or 0) > 10 and p.text_channel:
+                last = errors.splitlines()[-1][:300] if errors else "no error output"
+                asyncio.run_coroutine_threadsafe(
+                    p.text_channel.send(f"⚠️ {nxt.label()} stopped right away.\n-# {last}"), self.loop)
             asyncio.run_coroutine_threadsafe(self.play_next(guild), self.loop)
 
         vc.play(source, after=after)
