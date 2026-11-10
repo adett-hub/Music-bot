@@ -32,6 +32,7 @@ COOKIES_FILE = os.getenv("YTDLP_COOKIES")  # optional: cookies.txt if YouTube bl
 IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "300"))  # seconds before leaving when idle
 MAX_PLAYLIST = int(os.getenv("MAX_PLAYLIST", "100"))
 DJ_ROLE = os.getenv("DJ_ROLE", "DJ")
+ANNOUNCE = os.getenv("ANNOUNCE_NOW_PLAYING", "false").lower() in ("1", "true", "yes")  # post "Now playing" in chat
 LEAD_IN_MS = int(os.getenv("LEAD_IN_MS", "1500"))  # silence before each song so the start isn't clipped  # role name (case-insensitive) or role ID
 
 log = logging.getLogger("musicbot")
@@ -453,7 +454,7 @@ class MusicBot(discord.Client):
             asyncio.run_coroutine_threadsafe(self.play_next(guild), self.loop)
 
         vc.play(source, after=after)
-        if p.text_channel and not (finished is nxt and p.loop == "track"):
+        if ANNOUNCE and p.text_channel and not (finished is nxt and p.loop == "track"):
             await p.text_channel.send(f"🎶 Now playing {nxt.label()} — requested by {nxt.requester}")
 
     # ---- idle / auto-disconnect
@@ -832,4 +833,3 @@ if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Set DISCORD_TOKEN in your environment or .env file.")
     bot.run(TOKEN, log_handler=None)
-          
