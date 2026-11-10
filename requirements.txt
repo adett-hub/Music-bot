@@ -1,4 +1,6 @@
 discord.py[voice]>=2.6
+# discord.py 2.7.1 doesn't support davey 0.2's new transition API -> silent audio
+davey>=0.1.7,<0.2
 yt-dlp[default]
 python-dotenv
 aiohttp
