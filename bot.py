@@ -6,12 +6,15 @@ Commands: /play /skip /pause /resume /stop /queue /nowplaying /volume
 """
 
 import asyncio
+import json
 import logging
 import os
 import random
+import re
 from collections import deque
 from dataclasses import dataclass
 
+import aiohttp
 import discord
 import yt_dlp
 from discord import app_commands
@@ -24,6 +27,7 @@ GUILD_ID = os.getenv("GUILD_ID")  # optional: instant command sync to one server
 COOKIES_FILE = os.getenv("YTDLP_COOKIES")  # optional: cookies.txt if YouTube blocks the host
 IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "300"))  # seconds before leaving when idle
 MAX_PLAYLIST = int(os.getenv("MAX_PLAYLIST", "100"))
+DJ_ROLE = os.getenv("DJ_ROLE", "DJ")  # role name (case-insensitive) or role ID
 
 log = logging.getLogger("musicbot")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -48,10 +52,11 @@ FFMPEG_OPTS = {
 
 @dataclass
 class Track:
-    url: str          # page URL (re-resolved at play time; stream URLs expire)
+    url: str          # page URL or "ytsearch1:..." query (resolved at play time; stream URLs expire)
     title: str
     duration: int | None
     requester: str
+    page: str | None = None  # the actual page that played (filled in at play time)
 
     def label(self) -> str:
         return f"**{self.title}** `{fmt_time(self.duration)}`"
@@ -98,6 +103,99 @@ def _search_or_resolve(query: str) -> list[dict]:
             url = f"https://www.youtube.com/watch?v={url}"
         out.append({"url": url, "title": e.get("title") or "Unknown", "duration": e.get("duration")})
     return out
+
+
+# ---------------------------------------------------------------- Spotify (via public embed pages)
+# Spotify doesn't allow streaming its audio, so we read the song titles from its
+# public embed page and play each song by searching YouTube. No API key needed.
+# Embed pages list up to ~100 tracks for playlists/albums.
+
+SPOTIFY_RE = re.compile(
+    r"(?:open\.spotify\.com/(?:intl-[\w-]+/)?(?:embed/)?|spotify:)"
+    r"(track|album|playlist|artist)[/:]([A-Za-z0-9]+)"
+)
+SPOTIFY_SHORT = ("spotify.link/", "spotify.app.link/")
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/130.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def is_spotify(query: str) -> bool:
+    return bool(SPOTIFY_RE.search(query)) or any(s in query for s in SPOTIFY_SHORT)
+
+
+def _find_entity(obj):
+    """Locate the embed's entity dict (has a trackList, or is a single track)."""
+    if isinstance(obj, dict):
+        if "trackList" in obj or (obj.get("type") == "track" and ("title" in obj or "name" in obj)):
+            return obj
+        for v in obj.values():
+            found = _find_entity(v)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = _find_entity(v)
+            if found:
+                return found
+    return None
+
+
+def _clean(s: str | None) -> str:
+    return (s or "").replace(" ", " ").strip()
+
+
+def _to_entry(title: str, artist: str, duration_ms, uri: str | None) -> dict:
+    link = None
+    if uri and uri.startswith("spotify:track:"):
+        link = f"https://open.spotify.com/track/{uri.split(':')[-1]}"
+    query = f"{artist} - {title}" if artist else title
+    return {
+        "url": f"ytsearch1:{query} audio",
+        "title": f"{title} — {artist}" if artist else title,
+        "duration": int(duration_ms / 1000) if isinstance(duration_ms, (int, float)) else None,
+        "link": link,
+    }
+
+
+def parse_spotify_embed(html: str) -> list[dict]:
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.+?)</script>', html, re.S)
+    if not m:
+        raise ValueError("Spotify embed data not found (page format may have changed)")
+    entity = _find_entity(json.loads(m.group(1)))
+    if not entity:
+        raise ValueError("No tracks found in Spotify embed data")
+
+    if "trackList" in entity:
+        return [
+            _to_entry(_clean(t.get("title") or t.get("name")), _clean(t.get("subtitle")),
+                      t.get("duration"), t.get("uri"))
+            for t in entity["trackList"][:MAX_PLAYLIST]
+            if t.get("title") or t.get("name")
+        ]
+
+    artists = ", ".join(_clean(a.get("name")) for a in entity.get("artists") or [] if a.get("name"))
+    return [_to_entry(_clean(entity.get("title") or entity.get("name")),
+                      artists or _clean(entity.get("subtitle")),
+                      entity.get("duration"), entity.get("uri"))]
+
+
+async def resolve_spotify(query: str) -> list[dict]:
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(headers=HTTP_HEADERS, timeout=timeout) as session:
+        if not SPOTIFY_RE.search(query):  # short link -> follow redirect
+            async with session.get(query.strip(), allow_redirects=True) as r:
+                query = str(r.url)
+        m = SPOTIFY_RE.search(query)
+        if not m:
+            raise ValueError("Unrecognized Spotify link")
+        kind, sid = m.groups()
+        async with session.get(f"https://open.spotify.com/embed/{kind}/{sid}") as r:
+            r.raise_for_status()
+            html = await r.text()
+    return parse_spotify_embed(html)
 
 
 def _stream_url(page_url: str) -> tuple[str, dict]:
@@ -169,6 +267,7 @@ class MusicBot(discord.Client):
 
         if nxt.duration is None:
             nxt.duration = info.get("duration")
+        nxt.page = info.get("webpage_url") or nxt.page
 
         source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(stream, **FFMPEG_OPTS), volume=p.volume)
 
@@ -220,6 +319,42 @@ class MusicBot(discord.Client):
 bot = MusicBot()
 
 
+# ---------------------------------------------------------------- DJ role check
+
+class NotDJ(app_commands.CheckFailure):
+    pass
+
+
+def is_dj(member: discord.Member) -> bool:
+    if member.guild_permissions.administrator:
+        return True  # server admins can always control the bot
+    for role in member.roles:
+        if str(role.id) == DJ_ROLE or role.name.lower() == DJ_ROLE.lower():
+            return True
+    return False
+
+
+def dj_only():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if isinstance(interaction.user, discord.Member) and is_dj(interaction.user):
+            return True
+        raise NotDJ()
+    return app_commands.check(predicate)
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, NotDJ):
+        msg = f"🎧 You need the **{DJ_ROLE}** role to control the music."
+    else:
+        log.exception("Command error", exc_info=error)
+        msg = "Something went wrong running that command."
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
+
+
 # ---------------------------------------------------------------- command helpers
 
 async def ensure_voice(interaction: discord.Interaction) -> discord.VoiceClient | None:
@@ -252,9 +387,10 @@ async def require_vc(interaction: discord.Interaction) -> discord.VoiceClient | 
 
 # ---------------------------------------------------------------- commands
 
-@bot.tree.command(description="Play a song or playlist (YouTube/SoundCloud URL or search terms)")
+@bot.tree.command(description="Play a song or playlist (YouTube/Spotify/SoundCloud link or search terms)")
 @app_commands.describe(query="URL or search terms")
 @app_commands.guild_only()
+@dj_only()
 async def play(interaction: discord.Interaction, query: str):
     await interaction.response.defer(thinking=True)
     vc = await ensure_voice(interaction)
@@ -263,21 +399,27 @@ async def play(interaction: discord.Interaction, query: str):
     p = bot.player(interaction.guild.id)
     p.text_channel = interaction.channel
 
+    spotify = is_spotify(query)
     try:
-        results = await asyncio.to_thread(_search_or_resolve, query)
+        if spotify:
+            results = await resolve_spotify(query)
+        else:
+            results = await asyncio.to_thread(_search_or_resolve, query)
     except Exception as e:
         log.warning("Lookup failed for %r: %s", query, e)
-        return await interaction.followup.send("Couldn't find or load that. Try another link or search.")
+        hint = " Make sure the playlist is public." if spotify else " Try another link or search."
+        return await interaction.followup.send(f"Couldn't load that.{hint}")
     if not results:
         return await interaction.followup.send("No results.")
 
-    tracks = [Track(r["url"], r["title"], r["duration"], interaction.user.display_name) for r in results]
+    tracks = [Track(r["url"], r["title"], r["duration"], interaction.user.display_name, r.get("link"))
+              for r in results]
     p.queue.extend(tracks)
 
     if len(tracks) == 1:
         msg = f"➕ Queued {tracks[0].label()}" if (vc.is_playing() or vc.is_paused()) else f"▶️ Starting {tracks[0].label()}"
     else:
-        msg = f"➕ Queued **{len(tracks)}** tracks from the playlist."
+        msg = f"➕ Queued **{len(tracks)}** tracks" + (" from Spotify (played via YouTube)." if spotify else " from the playlist.")
     await interaction.followup.send(msg)
 
     if not vc.is_playing() and not vc.is_paused():
@@ -286,6 +428,7 @@ async def play(interaction: discord.Interaction, query: str):
 
 @bot.tree.command(description="Skip the current track")
 @app_commands.guild_only()
+@dj_only()
 async def skip(interaction: discord.Interaction):
     vc = await require_vc(interaction)
     if not vc:
@@ -301,6 +444,7 @@ async def skip(interaction: discord.Interaction):
 
 @bot.tree.command(description="Pause playback")
 @app_commands.guild_only()
+@dj_only()
 async def pause(interaction: discord.Interaction):
     vc = await require_vc(interaction)
     if vc and vc.is_playing():
@@ -312,6 +456,7 @@ async def pause(interaction: discord.Interaction):
 
 @bot.tree.command(description="Resume playback")
 @app_commands.guild_only()
+@dj_only()
 async def resume(interaction: discord.Interaction):
     vc = await require_vc(interaction)
     if vc and vc.is_paused():
@@ -323,6 +468,7 @@ async def resume(interaction: discord.Interaction):
 
 @bot.tree.command(description="Stop playback and clear the queue")
 @app_commands.guild_only()
+@dj_only()
 async def stop(interaction: discord.Interaction):
     vc = await require_vc(interaction)
     if not vc:
@@ -360,12 +506,13 @@ async def nowplaying(interaction: discord.Interaction):
     p = bot.player(interaction.guild.id)
     if not p.current:
         return await interaction.response.send_message("Nothing is playing.", ephemeral=True)
-    await interaction.response.send_message(f"🎶 {p.current.label()} — requested by {p.current.requester}\n{p.current.url}")
+    await interaction.response.send_message(f"🎶 {p.current.label()} — requested by {p.current.requester}\n{p.current.page or p.current.url}")
 
 
 @bot.tree.command(description="Set volume (0–150)")
 @app_commands.describe(percent="Volume percent")
 @app_commands.guild_only()
+@dj_only()
 async def volume(interaction: discord.Interaction, percent: app_commands.Range[int, 0, 150]):
     vc = await require_vc(interaction)
     if not vc:
@@ -379,6 +526,7 @@ async def volume(interaction: discord.Interaction, percent: app_commands.Range[i
 
 @bot.tree.command(description="Shuffle the queue")
 @app_commands.guild_only()
+@dj_only()
 async def shuffle(interaction: discord.Interaction):
     if not await require_vc(interaction):
         return
@@ -392,6 +540,7 @@ async def shuffle(interaction: discord.Interaction):
 @bot.tree.command(description="Remove a track from the queue by its number")
 @app_commands.describe(position="Position shown in /queue")
 @app_commands.guild_only()
+@dj_only()
 async def remove(interaction: discord.Interaction, position: app_commands.Range[int, 1]):
     if not await require_vc(interaction):
         return
@@ -410,6 +559,7 @@ async def remove(interaction: discord.Interaction, position: app_commands.Range[
     app_commands.Choice(name="queue", value="queue"),
 ])
 @app_commands.guild_only()
+@dj_only()
 async def loop(interaction: discord.Interaction, mode: app_commands.Choice[str]):
     if not await require_vc(interaction):
         return
@@ -419,6 +569,7 @@ async def loop(interaction: discord.Interaction, mode: app_commands.Choice[str])
 
 @bot.tree.command(description="Disconnect the bot")
 @app_commands.guild_only()
+@dj_only()
 async def leave(interaction: discord.Interaction):
     vc = await require_vc(interaction)
     if not vc:
