@@ -127,6 +127,24 @@ def fmt_time(seconds: int | float | None) -> str:
     return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
 
 
+class MeteredSource(discord.PCMVolumeTransformer):
+    """Volume control + counts audio frames and loudness, for /debug."""
+    def __init__(self, original, volume=1.0):
+        super().__init__(original, volume=volume)
+        self.frames = 0
+        self.peak = 0
+
+    def read(self) -> bytes:
+        data = super().read()
+        if data:
+            self.frames += 1
+            if self.frames % 10 == 0:
+                from array import array
+                samples = array("h", data)
+                self.peak = max(abs(min(samples)), max(samples))
+        return data
+
+
 class GuildPlayer:
     def __init__(self):
         self.queue: deque[Track] = deque()
@@ -135,6 +153,7 @@ class GuildPlayer:
         self.loop: str = "off"  # off | track | queue
         self.text_channel: discord.abc.Messageable | None = None
         self.idle_task: asyncio.Task | None = None
+        self.proc: subprocess.Popen | None = None
 
 
 # ---------------------------------------------------------------- yt-dlp helpers
@@ -348,7 +367,8 @@ class MusicBot(discord.Client):
         proc, info_path = _open_audio(info, errlog)
         ffmpeg = discord.FFmpegPCMAudio(proc.stdout, pipe=True,
                                         options=FFMPEG_OPTS["options"], stderr=errlog)
-        source = discord.PCMVolumeTransformer(ffmpeg, volume=p.volume)
+        source = MeteredSource(ffmpeg, volume=p.volume)
+        p.proc = proc
         started = time.monotonic()
 
         def after(err):
@@ -666,6 +686,48 @@ async def loop(interaction: discord.Interaction, mode: app_commands.Choice[str])
         return
     bot.player(interaction.guild.id).loop = mode.value
     await interaction.response.send_message(f"🔁 Loop: **{mode.value}**")
+
+
+@bot.tree.command(description="Diagnostics: is audio flowing and reaching Discord?")
+@app_commands.guild_only()
+@dj_only()
+async def debug(interaction: discord.Interaction):
+    vc = interaction.guild.voice_client
+    p = bot.player(interaction.guild.id)
+    lines = []
+    if not vc:
+        return await interaction.response.send_message("Not in a voice channel.", ephemeral=True)
+    lines.append(f"Voice: connected={vc.is_connected()} playing={vc.is_playing()} paused={vc.is_paused()} "
+                 f"latency={vc.average_latency * 1000:.0f}ms")
+    src = vc.source
+    if isinstance(src, MeteredSource):
+        lines.append(f"Audio sent: {src.frames} frames (~{src.frames * 0.02:.1f}s), "
+                     f"current peak level {src.peak} of 32767" + (" ⚠️ silent" if src.peak < 50 else ""))
+    if p.proc:
+        rc = p.proc.poll()
+        lines.append(f"yt-dlp download: {'running' if rc is None else f'exited with code {rc}'}")
+    conn = getattr(vc, "_connection", None)
+    if conn is not None:
+        lines.append(f"Encryption (DAVE): version={getattr(conn, 'dave_protocol_version', '?')} "
+                     f"ready={getattr(conn, 'can_encrypt', '?')} "
+                     f"supported={getattr(conn, 'max_dave_protocol_version', '?')}")
+    lines.append(f"Cookies loaded: {'yes' if COOKIES_FILE else 'no'}")
+    await interaction.response.send_message("```\n" + "\n".join(lines) + "\n```", ephemeral=True)
+
+
+@bot.tree.command(description="Play a 5-second test beep (checks the Discord audio side only)")
+@app_commands.guild_only()
+@dj_only()
+async def testtone(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    vc = await ensure_voice(interaction)
+    if vc is None:
+        return
+    if vc.is_playing() or vc.is_paused():
+        return await interaction.followup.send("Use /stop first, then try /testtone.")
+    tone = discord.FFmpegPCMAudio("sine=frequency=440:duration=5", before_options="-f lavfi")
+    vc.play(MeteredSource(tone, volume=2.0))
+    await interaction.followup.send("🔔 Playing a 5-second beep. Hear it?")
 
 
 @bot.tree.command(description="Disconnect the bot")
