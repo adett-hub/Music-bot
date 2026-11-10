@@ -37,7 +37,7 @@ PUBLIC_TTL = int(os.getenv("PUBLIC_MSG_SECONDS", "120"))  # auto-delete /queue &
 NOTICE_TTL = int(os.getenv("NOTICE_SECONDS", "60"))       # auto-delete error notices (0 = keep)
 LEAD_IN_MS = int(os.getenv("LEAD_IN_MS", "1500"))  # silence before each song so the start isn't clipped  # role name (case-insensitive) or role ID
 
-BOT_VERSION = "2026-11-10b (smart Spotify matching, paged queue)"
+BOT_VERSION = "2026-11-10c (audio buffer fixes speed-up)"
 
 log = logging.getLogger("musicbot")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -134,6 +134,76 @@ def fmt_time(seconds: int | float | None) -> str:
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
     return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
+
+
+class BufferedPCM(discord.AudioSource):
+    """Reads PCM from FFmpeg on a background thread and keeps ~15s ready.
+    discord.py sends audio on a strict 20ms clock; if a read blocks (slow download),
+    it later blasts the backlog to catch up, which sounds sped up. With a buffer,
+    read() never blocks: on a rare underrun we send 20ms of silence instead."""
+
+    FRAME = 3840  # 20ms of 48kHz 16-bit stereo
+    SILENCE = b"\x00" * 3840
+
+    def __init__(self, original: discord.AudioSource, max_seconds: float = 15.0):
+        import threading
+        self.original = original
+        self.buf: deque[bytes] = deque()
+        self.max_frames = int(max_seconds * 50)
+        self.eof = False
+        self.underruns = 0
+        self._stop = threading.Event()
+        self._space = threading.Event()
+        self._space.set()
+        self._data = threading.Event()
+        self._thread = threading.Thread(target=self._fill, daemon=True)
+        self._thread.start()
+
+    def _fill(self):
+        try:
+            while not self._stop.is_set():
+                if len(self.buf) >= self.max_frames:
+                    self._space.clear()
+                    self._space.wait(0.5)
+                    continue
+                frame = self.original.read()
+                if not frame:
+                    break
+                if len(frame) < self.FRAME:
+                    frame += b"\x00" * (self.FRAME - len(frame))
+                self.buf.append(frame)
+                self._data.set()
+        except Exception as e:
+            log.warning("Audio buffer reader stopped: %s", e)
+        finally:
+            self.eof = True
+            self._data.set()
+
+    def wait_ready(self, seconds: float = 3.0, timeout: float = 20.0) -> int:
+        """Block until `seconds` of audio is buffered (or the stream ends / times out)."""
+        need, end = int(seconds * 50), time.monotonic() + timeout
+        while len(self.buf) < need and not self.eof and time.monotonic() < end:
+            self._data.wait(0.1)
+            self._data.clear()
+        return len(self.buf)
+
+    def read(self) -> bytes:
+        if self.buf:
+            frame = self.buf.popleft()
+            self._space.set()
+            return frame
+        if self.eof:
+            return b""
+        self.underruns += 1
+        return self.SILENCE
+
+    def is_opus(self) -> bool:
+        return False
+
+    def cleanup(self):
+        self._stop.set()
+        self._space.set()
+        self.original.cleanup()
 
 
 class MeteredSource(discord.PCMVolumeTransformer):
@@ -607,7 +677,10 @@ class MusicBot(discord.Client):
         proc, info_path = _open_audio(info, errlog)
         ffmpeg = discord.FFmpegPCMAudio(proc.stdout, pipe=True,
                                         options=FFMPEG_OPTS["options"], stderr=errlog)
-        source = MeteredSource(ffmpeg, volume=p.volume, lead_in_ms=LEAD_IN_MS)
+        buffered = BufferedPCM(ffmpeg)
+        ready = await asyncio.to_thread(buffered.wait_ready, 3.0, 20.0)
+        log.info("Buffered %.1fs before starting", ready / 50)
+        source = MeteredSource(buffered, volume=p.volume, lead_in_ms=LEAD_IN_MS)
         p.proc = proc
         started = time.monotonic()
 
@@ -626,6 +699,9 @@ class MusicBot(discord.Client):
                 log.error("Player error: %s", err)
             if errors:
                 log.warning("Stream errors for %s:\n%s", nxt.page, errors[-2000:])
+            if buffered.underruns:
+                log.info("Buffer ran dry %d times (%.1fs of filler silence) on %s",
+                         buffered.underruns, buffered.underruns * 0.02, nxt.page)
             elapsed = time.monotonic() - started
             failed = (rc not in (None, 0)) or (elapsed < 3 + LEAD_IN_MS / 1000 and (nxt.duration or 0) > 10)
             if failed and p.text_channel:
@@ -1046,6 +1122,10 @@ async def debug(interaction: discord.Interaction):
                  f"latency={vc.average_latency * 1000:.0f}ms")
     src = vc.source
     if isinstance(src, MeteredSource):
+        inner = src.original
+        if isinstance(inner, BufferedPCM):
+            lines.append(f"Buffer: {len(inner.buf) * 0.02:.1f}s ready, ran dry {inner.underruns}x, "
+                         f"download {'finished' if inner.eof else 'in progress'}")
         lines.append(f"Audio sent: {src.frames} frames (~{src.frames * 0.02:.1f}s), "
                      f"current peak level {src.peak} of 32767" + (" ⚠️ silent" if src.peak < 50 else ""))
     if p.proc:
