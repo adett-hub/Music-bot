@@ -4,3 +4,5 @@ davey>=0.1.7,<0.2
 yt-dlp[default]
 python-dotenv
 aiohttp
+ytmusicapi
+ 
