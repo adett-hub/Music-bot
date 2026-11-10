@@ -10,6 +10,9 @@ import json
 import logging
 import os
 import random
+import shlex
+import sys
+import time
 import re
 from collections import deque
 from dataclasses import dataclass
@@ -44,7 +47,7 @@ if COOKIES_FILE:
 
 FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn",
+    "options": "-vn -loglevel warning",
 }
 
 
@@ -269,11 +272,27 @@ class MusicBot(discord.Client):
             nxt.duration = info.get("duration")
         nxt.page = info.get("webpage_url") or nxt.page
 
-        source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(stream, **FFMPEG_OPTS), volume=p.volume)
+        # YouTube's media servers expect the same headers yt-dlp used, or they return 403
+        before = FFMPEG_OPTS["before_options"]
+        headers = info.get("http_headers") or {}
+        if headers:
+            before += " -headers " + shlex.quote("".join(f"{k}: {v}\r\n" for k, v in headers.items()))
+        log.info("Streaming %s (format %s)", info.get("webpage_url"), info.get("format_id"))
+        ffmpeg = discord.FFmpegPCMAudio(stream, before_options=before,
+                                        options=FFMPEG_OPTS["options"], stderr=sys.stderr)
+        source = discord.PCMVolumeTransformer(ffmpeg, volume=p.volume)
+        started = time.monotonic()
 
         def after(err):
             if err:
                 log.error("Player error: %s", err)
+            elapsed = time.monotonic() - started
+            if elapsed < 3 and (nxt.duration or 0) > 10:
+                log.error("Track ended after %.1fs - FFmpeg likely couldn't read the stream (see errors above)", elapsed)
+                if p.text_channel:
+                    asyncio.run_coroutine_threadsafe(
+                        p.text_channel.send(f"⚠️ {nxt.label()} stopped right away — YouTube may be blocking the server."),
+                        self.loop)
             asyncio.run_coroutine_threadsafe(self.play_next(guild), self.loop)
 
         vc.play(source, after=after)
