@@ -553,7 +553,7 @@ async def ensure_voice(interaction: discord.Interaction) -> discord.VoiceClient 
             if not await wait_for_dave(vc):
                 log.error("Voice encryption still not ready; audio will be silent")
                 await interaction.followup.send("⚠️ Couldn't set up voice encryption with Discord — "
-                                                "audio may be silent. Check the Railway logs.")
+                                                "audio may be silent. Check the Railway logs.", ephemeral=True)
     elif vc.channel != user_vc:
         if vc.is_playing() and len([m for m in vc.channel.members if not m.bot]) > 0:
             await interaction.followup.send(f"I'm busy in {vc.channel.mention}.", ephemeral=True)
@@ -581,7 +581,7 @@ async def require_vc(interaction: discord.Interaction) -> discord.VoiceClient | 
 @app_commands.guild_only()
 @dj_only()
 async def play(interaction: discord.Interaction, query: str):
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
     vc = await ensure_voice(interaction)
     if vc is None:
         return
@@ -600,19 +600,26 @@ async def play(interaction: discord.Interaction, query: str):
         hint = " Make sure the playlist is public." if spotify else ""
         if "confirm you" in reason.lower() and "bot" in reason.lower():
             hint = " YouTube is blocking the server — add YouTube cookies (see README)."
-        return await interaction.followup.send(f"Couldn't load that.{hint}\n-# {reason}")
+        return await interaction.followup.send(f"Couldn't load that.{hint}\n-# {reason}", ephemeral=True)
     if not results:
-        return await interaction.followup.send("No results.")
+        return await interaction.followup.send("No results.", ephemeral=True)
 
     tracks = [Track(r["url"], r["title"], r["duration"], interaction.user.display_name, r.get("link"))
               for r in results]
+    busy = vc.is_playing() or vc.is_paused()
+    first_pos = len(p.queue) + 1
     p.queue.extend(tracks)
+    last_pos = len(p.queue)
 
     if len(tracks) == 1:
-        msg = f"➕ Queued {tracks[0].label()}" if (vc.is_playing() or vc.is_paused()) else f"▶️ Starting {tracks[0].label()}"
+        msg = (f"➕ Queued {tracks[0].label()} — **#{first_pos}** in queue" if busy
+               else f"▶️ Starting {tracks[0].label()}")
+    elif busy:
+        msg = (f"➕ Queued **{len(tracks)}** tracks" + (" from Spotify (played via YouTube)" if spotify else "")
+               + f" — positions **#{first_pos}–#{last_pos}**")
     else:
         msg = f"➕ Queued **{len(tracks)}** tracks" + (" from Spotify (played via YouTube)." if spotify else " from the playlist.")
-    await interaction.followup.send(msg)
+    await interaction.followup.send(msg, ephemeral=True)
 
     if not vc.is_playing() and not vc.is_paused():
         await bot.play_next(interaction.guild)
@@ -631,7 +638,7 @@ async def skip(interaction: discord.Interaction):
     if p.loop == "track":
         p.loop = "off"  # skipping should actually move on
     vc.stop()  # triggers `after` -> play_next
-    await interaction.response.send_message("⏭️ Skipped.")
+    await interaction.response.send_message("⏭️ Skipped.", ephemeral=True)
 
 
 @bot.tree.command(description="Pause playback")
@@ -641,7 +648,7 @@ async def pause(interaction: discord.Interaction):
     vc = await require_vc(interaction)
     if vc and vc.is_playing():
         vc.pause()
-        await interaction.response.send_message("⏸️ Paused.")
+        await interaction.response.send_message("⏸️ Paused.", ephemeral=True)
     elif vc:
         await interaction.response.send_message("Nothing is playing.", ephemeral=True)
 
@@ -653,7 +660,7 @@ async def resume(interaction: discord.Interaction):
     vc = await require_vc(interaction)
     if vc and vc.is_paused():
         vc.resume()
-        await interaction.response.send_message("▶️ Resumed.")
+        await interaction.response.send_message("▶️ Resumed.", ephemeral=True)
     elif vc:
         await interaction.response.send_message("Not paused.", ephemeral=True)
 
@@ -670,7 +677,7 @@ async def stop(interaction: discord.Interaction):
     p.loop = "off"
     p.current = None
     vc.stop()
-    await interaction.response.send_message("⏹️ Stopped and cleared the queue.")
+    await interaction.response.send_message("⏹️ Stopped and cleared the queue.", ephemeral=True)
 
 
 @bot.tree.command(description="Show the queue")
@@ -713,7 +720,7 @@ async def volume(interaction: discord.Interaction, percent: app_commands.Range[i
     p.volume = percent / 100
     if isinstance(vc.source, discord.PCMVolumeTransformer):
         vc.source.volume = p.volume
-    await interaction.response.send_message(f"🔊 Volume set to {percent}%.")
+    await interaction.response.send_message(f"🔊 Volume set to {percent}%.", ephemeral=True)
 
 
 @bot.tree.command(description="Shuffle the queue")
@@ -726,7 +733,7 @@ async def shuffle(interaction: discord.Interaction):
     items = list(p.queue)
     random.shuffle(items)
     p.queue = deque(items)
-    await interaction.response.send_message(f"🔀 Shuffled {len(items)} tracks.")
+    await interaction.response.send_message(f"🔀 Shuffled {len(items)} tracks.", ephemeral=True)
 
 
 @bot.tree.command(description="Remove a track from the queue by its number")
@@ -741,7 +748,7 @@ async def remove(interaction: discord.Interaction, position: app_commands.Range[
         return await interaction.response.send_message("No track at that position.", ephemeral=True)
     t = p.queue[position - 1]
     del p.queue[position - 1]
-    await interaction.response.send_message(f"🗑️ Removed {t.label()}")
+    await interaction.response.send_message(f"🗑️ Removed {t.label()}", ephemeral=True)
 
 
 @bot.tree.command(description="Set loop mode")
@@ -756,7 +763,7 @@ async def loop(interaction: discord.Interaction, mode: app_commands.Choice[str])
     if not await require_vc(interaction):
         return
     bot.player(interaction.guild.id).loop = mode.value
-    await interaction.response.send_message(f"🔁 Loop: **{mode.value}**")
+    await interaction.response.send_message(f"🔁 Loop: **{mode.value}**", ephemeral=True)
 
 
 @bot.tree.command(description="Diagnostics: is audio flowing and reaching Discord?")
@@ -795,15 +802,15 @@ async def debug(interaction: discord.Interaction):
 @app_commands.guild_only()
 @dj_only()
 async def testtone(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
     vc = await ensure_voice(interaction)
     if vc is None:
         return
     if vc.is_playing() or vc.is_paused():
-        return await interaction.followup.send("Use /stop first, then try /testtone.")
+        return await interaction.followup.send("Use /stop first, then try /testtone.", ephemeral=True)
     tone = discord.FFmpegPCMAudio("sine=frequency=440:duration=5", before_options="-f lavfi")
     vc.play(MeteredSource(tone, volume=2.0))
-    await interaction.followup.send("🔔 Playing a 5-second beep. Hear it?")
+    await interaction.followup.send("🔔 Playing a 5-second beep. Hear it?", ephemeral=True)
 
 
 @bot.tree.command(description="Disconnect the bot")
@@ -818,10 +825,11 @@ async def leave(interaction: discord.Interaction):
         p.queue.clear()
         bot.cancel_idle_timer(p)
     await vc.disconnect()
-    await interaction.response.send_message("👋 Bye.")
+    await interaction.response.send_message("👋 Bye.", ephemeral=True)
 
 
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Set DISCORD_TOKEN in your environment or .env file.")
     bot.run(TOKEN, log_handler=None)
+          
