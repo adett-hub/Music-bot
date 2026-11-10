@@ -42,6 +42,30 @@ YDL_BASE = {
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
 }
+
+
+def _cookies_from_env() -> str | None:
+    """YTDLP_COOKIES_TXT holds the contents of a cookies.txt (plain or base64).
+    Written to a private temp file so it never needs to be in the repo."""
+    raw = os.getenv("YTDLP_COOKIES_TXT", "").strip()
+    if not raw:
+        return None
+    if "\t" not in raw:  # not plain Netscape format -> try base64
+        import base64
+        try:
+            raw = base64.b64decode(raw).decode("utf-8")
+        except Exception:
+            log.error("YTDLP_COOKIES_TXT is neither a cookies.txt nor base64 of one; ignoring")
+            return None
+    path = "/tmp/yt-cookies.txt"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(raw.replace("\r\n", "\n") + "\n")
+    os.chmod(path, 0o600)
+    log.info("Loaded YouTube cookies from YTDLP_COOKIES_TXT")
+    return path
+
+
+COOKIES_FILE = COOKIES_FILE or _cookies_from_env()
 if COOKIES_FILE:
     YDL_BASE["cookiefile"] = COOKIES_FILE
 
@@ -426,8 +450,11 @@ async def play(interaction: discord.Interaction, query: str):
             results = await asyncio.to_thread(_search_or_resolve, query)
     except Exception as e:
         log.warning("Lookup failed for %r: %s", query, e)
-        hint = " Make sure the playlist is public." if spotify else " Try another link or search."
-        return await interaction.followup.send(f"Couldn't load that.{hint}")
+        reason = str(e).replace("ERROR: ", "").split("\n")[0][:300]
+        hint = " Make sure the playlist is public." if spotify else ""
+        if "confirm you" in reason.lower() and "bot" in reason.lower():
+            hint = " YouTube is blocking the server — add YouTube cookies (see README)."
+        return await interaction.followup.send(f"Couldn't load that.{hint}\n-# {reason}")
     if not results:
         return await interaction.followup.send("No results.")
 
