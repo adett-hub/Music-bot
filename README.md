@@ -4,12 +4,16 @@ Slash-command music bot (discord.py + yt-dlp + FFmpeg). Separate queue per serve
 
 | Command | What it does |
 |---|---|
-| `/play <url or search>` | Play/queue a song or a whole playlist (YouTube, SoundCloud, etc.) |
+| `/play <url or search>` | Play/queue a song or a whole playlist (YouTube, Spotify, SoundCloud, etc.) |
+
+**Spotify links** (tracks, albums, public playlists, artists) work without any Spotify account or API key. The bot reads the song list from Spotify's public embed page and plays each song by searching YouTube. Playlists are capped at about 100 tracks, and the occasional song may match a different version (live, cover).
 | `/skip` `/pause` `/resume` `/stop` | Playback controls (`/stop` clears the queue) |
 | `/queue` `/nowplaying` | Show what's queued / playing |
 | `/volume <0-150>` | Set volume |
 | `/shuffle` `/remove <#>` `/loop off/track/queue` | Queue management |
 | `/leave` | Disconnect |
+
+**DJ role:** only members with the `DJ` role (or server admins) can use the control commands. Anyone can use `/queue` and `/nowplaying`. Create a role named `DJ` in Server Settings → Roles, or set `DJ_ROLE` to a different role name or role ID.
 
 The bot leaves on its own after 5 idle minutes or when everyone leaves the channel.
 
