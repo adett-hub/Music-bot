@@ -299,6 +299,57 @@ def _open_audio(info: dict, errlog) -> tuple[subprocess.Popen, str]:
     return proc, info_path
 
 
+# ---------------------------------------------------------------- voice encryption (DAVE) diagnostics
+# discord.py silently swallows DAVE handshake failures; log them so they show in Railway.
+from discord import gateway as _gw, voice_state as _vs
+
+_MLS_NAMES = {25: "external sender", 26: "key package", 27: "proposals", 28: "commit/welcome",
+              29: "commit", 30: "welcome", 31: "invalid commit"}
+_orig_bin = _gw.DiscordVoiceWebSocket.received_binary_message
+_orig_recover = _vs.VoiceConnectionState._recover_from_invalid_commit
+_orig_exec = _vs.VoiceConnectionState._execute_transition
+
+
+async def _logged_bin(self, msg: bytes):
+    await _orig_bin(self, msg)
+    st = self._connection
+    sess = st.dave_session
+    log.info("DAVE: got %s (op %s, %d bytes) -> ready=%s",
+             _MLS_NAMES.get(msg[2], "?"), msg[2], len(msg), bool(sess and sess.ready))
+
+
+async def _logged_recover(self, transition_id):
+    log.warning("DAVE: handshake message rejected (transition %s)", transition_id, exc_info=sys.exc_info()[0] is not None)
+    await _orig_recover(self, transition_id)
+
+
+async def _logged_exec(self, transition_id):
+    await _orig_exec(self, transition_id)
+    log.info("DAVE: executed transition %s -> version=%s can_encrypt=%s",
+             transition_id, self.dave_protocol_version, self.can_encrypt)
+
+
+_gw.DiscordVoiceWebSocket.received_binary_message = _logged_bin
+_vs.VoiceConnectionState._recover_from_invalid_commit = _logged_recover
+_vs.VoiceConnectionState._execute_transition = _logged_exec
+
+
+def dave_ok(vc: discord.VoiceClient) -> bool:
+    conn = getattr(vc, "_connection", None)
+    if conn is None or getattr(conn, "dave_protocol_version", 0) == 0:
+        return True  # channel not using E2EE
+    return bool(conn.can_encrypt)
+
+
+async def wait_for_dave(vc: discord.VoiceClient, timeout: float = 8.0) -> bool:
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if dave_ok(vc):
+            return True
+        await asyncio.sleep(0.25)
+    return dave_ok(vc)
+
+
 # ---------------------------------------------------------------- bot
 
 class MusicBot(discord.Client):
@@ -483,6 +534,19 @@ async def ensure_voice(interaction: discord.Interaction) -> discord.VoiceClient 
     vc = interaction.guild.voice_client
     if vc is None:
         vc = await user_vc.connect(self_deaf=True)
+        for attempt in range(2):
+            if await wait_for_dave(vc):
+                log.info("Voice encryption ready")
+                break
+            log.warning("Voice encryption handshake didn't finish (attempt %d) - reconnecting", attempt + 1)
+            await vc.disconnect(force=True)
+            await asyncio.sleep(1)
+            vc = await user_vc.connect(self_deaf=True)
+        else:
+            if not await wait_for_dave(vc):
+                log.error("Voice encryption still not ready; audio will be silent")
+                await interaction.followup.send("⚠️ Couldn't set up voice encryption with Discord — "
+                                                "audio may be silent. Check the Railway logs.")
     elif vc.channel != user_vc:
         if vc.is_playing() and len([m for m in vc.channel.members if not m.bot]) > 0:
             await interaction.followup.send(f"I'm busy in {vc.channel.mention}.", ephemeral=True)
@@ -712,6 +776,11 @@ async def debug(interaction: discord.Interaction):
                      f"ready={getattr(conn, 'can_encrypt', '?')} "
                      f"supported={getattr(conn, 'max_dave_protocol_version', '?')}")
     lines.append(f"Cookies loaded: {'yes' if COOKIES_FILE else 'no'}")
+    try:
+        from importlib.metadata import version
+        lines.append(f"discord.py {discord.__version__}, davey {version('davey')}")
+    except Exception:
+        pass
     await interaction.response.send_message("```\n" + "\n".join(lines) + "\n```", ephemeral=True)
 
 
@@ -749,3 +818,4 @@ if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Set DISCORD_TOKEN in your environment or .env file.")
     bot.run(TOKEN, log_handler=None)
+          
