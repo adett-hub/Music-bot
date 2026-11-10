@@ -31,7 +31,8 @@ GUILD_ID = os.getenv("GUILD_ID")  # optional: instant command sync to one server
 COOKIES_FILE = os.getenv("YTDLP_COOKIES")  # optional: cookies.txt if YouTube blocks the host
 IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "300"))  # seconds before leaving when idle
 MAX_PLAYLIST = int(os.getenv("MAX_PLAYLIST", "100"))
-DJ_ROLE = os.getenv("DJ_ROLE", "DJ")  # role name (case-insensitive) or role ID
+DJ_ROLE = os.getenv("DJ_ROLE", "DJ")
+LEAD_IN_MS = int(os.getenv("LEAD_IN_MS", "1500"))  # silence before each song so the start isn't clipped  # role name (case-insensitive) or role ID
 
 log = logging.getLogger("musicbot")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -129,12 +130,18 @@ def fmt_time(seconds: int | float | None) -> str:
 
 class MeteredSource(discord.PCMVolumeTransformer):
     """Volume control + counts audio frames and loudness, for /debug."""
-    def __init__(self, original, volume=1.0):
+    SILENT_FRAME = b"\x00" * 3840  # 20ms of 48kHz stereo 16-bit silence
+
+    def __init__(self, original, volume=1.0, lead_in_ms: int = 0):
         super().__init__(original, volume=volume)
         self.frames = 0
         self.peak = 0
+        self.lead_in = lead_in_ms // 20
 
     def read(self) -> bytes:
+        if self.lead_in > 0:
+            self.lead_in -= 1
+            return self.SILENT_FRAME
         data = super().read()
         if data:
             self.frames += 1
@@ -418,7 +425,7 @@ class MusicBot(discord.Client):
         proc, info_path = _open_audio(info, errlog)
         ffmpeg = discord.FFmpegPCMAudio(proc.stdout, pipe=True,
                                         options=FFMPEG_OPTS["options"], stderr=errlog)
-        source = MeteredSource(ffmpeg, volume=p.volume)
+        source = MeteredSource(ffmpeg, volume=p.volume, lead_in_ms=LEAD_IN_MS)
         p.proc = proc
         started = time.monotonic()
 
@@ -438,7 +445,7 @@ class MusicBot(discord.Client):
             if errors:
                 log.warning("Stream errors for %s:\n%s", nxt.page, errors[-2000:])
             elapsed = time.monotonic() - started
-            failed = (rc not in (None, 0)) or (elapsed < 3 and (nxt.duration or 0) > 10)
+            failed = (rc not in (None, 0)) or (elapsed < 3 + LEAD_IN_MS / 1000 and (nxt.duration or 0) > 10)
             if failed and p.text_channel:
                 last = errors.splitlines()[-1][:300] if errors else "no error output"
                 asyncio.run_coroutine_threadsafe(
@@ -818,4 +825,3 @@ if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Set DISCORD_TOKEN in your environment or .env file.")
     bot.run(TOKEN, log_handler=None)
-          
