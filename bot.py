@@ -33,10 +33,15 @@ IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "300"))  # seconds before leaving w
 MAX_PLAYLIST = int(os.getenv("MAX_PLAYLIST", "100"))
 DJ_ROLE = os.getenv("DJ_ROLE", "DJ")
 ANNOUNCE = os.getenv("ANNOUNCE_NOW_PLAYING", "false").lower() in ("1", "true", "yes")  # post "Now playing" in chat
+PUBLIC_TTL = int(os.getenv("PUBLIC_MSG_SECONDS", "120"))  # auto-delete /queue & /nowplaying (0 = keep)
+NOTICE_TTL = int(os.getenv("NOTICE_SECONDS", "60"))       # auto-delete error notices (0 = keep)
 LEAD_IN_MS = int(os.getenv("LEAD_IN_MS", "1500"))  # silence before each song so the start isn't clipped  # role name (case-insensitive) or role ID
+
+BOT_VERSION = "2026-11-10b (smart Spotify matching, paged queue)"
 
 log = logging.getLogger("musicbot")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log.info("Music bot version %s", BOT_VERSION)
 
 YDL_BASE = {
     "format": "bestaudio/best",
@@ -115,6 +120,8 @@ class Track:
     duration: int | None
     requester: str
     page: str | None = None  # the actual page that played (filled in at play time)
+    meta: dict | None = None  # Spotify info {title, artists, duration} -> smart YouTube matching
+    matched: str | None = None  # cached best-match URL so loops/requeues don't search again
 
     def label(self) -> str:
         return f"**{self.title}** `{fmt_time(self.duration)}`"
@@ -234,12 +241,15 @@ def _to_entry(title: str, artist: str, duration_ms, uri: str | None) -> dict:
     link = None
     if uri and uri.startswith("spotify:track:"):
         link = f"https://open.spotify.com/track/{uri.split(':')[-1]}"
+    duration = int(duration_ms / 1000) if isinstance(duration_ms, (int, float)) else None
+    artists = [a.strip() for a in re.split(r",|&| x |\bfeat\.?\b|\bft\.?\b", artist or "") if a.strip()]
     query = f"{artist} - {title}" if artist else title
     return {
-        "url": f"ytsearch1:{query} audio",
+        "url": f"ytsearch1:{query}",  # fallback only; play time uses the smart matcher
         "title": f"{title} — {artist}" if artist else title,
-        "duration": int(duration_ms / 1000) if isinstance(duration_ms, (int, float)) else None,
+        "duration": duration,
         "link": link,
+        "meta": {"title": title, "artists": artists, "duration": duration},
     }
 
 
@@ -279,6 +289,162 @@ async def resolve_spotify(query: str) -> list[dict]:
             r.raise_for_status()
             html = await r.text()
     return parse_spotify_embed(html)
+
+
+# ---------------------------------------------------------------- matching Spotify songs to YouTube
+# Pull several candidates from YouTube Music's song catalog (official studio versions,
+# same as Spotify) and from regular YouTube, then score each on title, artist,
+# length and unwanted versions (live, sped up, cover...). Highest score wins.
+
+import difflib
+import unicodedata
+
+try:
+    from ytmusicapi import YTMusic
+    _ytm = YTMusic()
+except Exception as e:  # library missing or init failed -> YouTube search only
+    _ytm = None
+    log.warning("YouTube Music search unavailable (%s); using YouTube search only", e)
+
+VERSION_WORDS = [
+    "live", "cover", "remix", "sped up", "speed up", "slowed", "reverb", "nightcore", "8d",
+    "karaoke", "instrumental", "acoustic", "extended", "1 hour", "10 hours", "loop", "reaction",
+    "mashup", "bass boosted", "chopped", "screwed", "demo", "piano version", "tribute", "parody",
+    "lofi", "lo-fi", "edit", "unplugged", "a cappella", "acapella", "8 bit", "ai cover",
+]
+MIN_SCORE = 35
+
+
+def _norm(text: str) -> str:
+    text = unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode().lower()
+    text = re.sub(r"\((?:feat|ft|with)[^)]*\)|\[(?:feat|ft|with)[^\]]*\]", " ", text)  # drop (feat. X)
+    text = re.sub(r"[^a-z0-9 ]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _core_title(title: str) -> str:
+    """Spotify title without ' - 2011 Remaster' / ' - Radio Edit' style suffixes."""
+    return _norm(re.split(r" - |\(", title or "")[0]) or _norm(title)
+
+
+def score_candidate(meta: dict, cand: dict) -> tuple[float, list[str]]:
+    why = []
+    want_title = _norm(meta["title"])
+    want_core = _core_title(meta["title"])
+    artists = [_norm(a) for a in meta.get("artists") or [] if _norm(a)]
+    c_title = _norm(cand.get("title"))
+    c_artists = _norm(" ".join(cand.get("artists") or []) + " " + (cand.get("channel") or ""))
+    haystack = f"{c_title} {c_artists}"
+
+    # title: similarity after removing artist names from the video title
+    stripped = c_title
+    for a in artists:
+        stripped = stripped.replace(a, " ")
+    stripped = re.sub(r"\b(official|music|video|audio|lyrics?|lyric|hd|hq|4k|mv|visualizer)\b", " ", stripped)
+    stripped = re.sub(r"\s+", " ", stripped).strip()
+    sim = max(difflib.SequenceMatcher(None, want_core, stripped).ratio(),
+              difflib.SequenceMatcher(None, want_title, stripped).ratio())
+    score = sim * 40
+    if want_core and want_core in c_title:
+        score += 10
+    why.append(f"title {sim:.2f}")
+
+    # artist
+    if artists:
+        hits = sum(1 for a in artists if a in haystack)
+        if hits:
+            score += 20 + 5 * (hits - 1)
+            why.append(f"artist x{hits}")
+        else:
+            score -= 15
+            why.append("no artist")
+
+    # length (strongest signal for picking the right version)
+    want_d, got_d = meta.get("duration"), cand.get("duration")
+    if want_d and got_d:
+        diff = abs(want_d - got_d)
+        score += 30 if diff <= 2 else 22 if diff <= 5 else 10 if diff <= 10 else -5 if diff <= 25 else -35
+        why.append(f"len ±{diff}s")
+
+    # unwanted versions, unless Spotify's title says that version
+    want_words = f" {want_title} "
+    for w in VERSION_WORDS:
+        pattern = rf"\b{re.escape(w)}\b"
+        if re.search(pattern, c_title) and not re.search(pattern, want_words):
+            score -= 40
+            why.append(f"-{w}")
+
+    # official sources
+    if cand.get("source") == "ytmusic":
+        score += 15
+        why.append("YT Music song")
+    if (cand.get("channel") or "").lower().endswith(" - topic"):
+        score += 12
+        why.append("Topic")
+    if re.search(r"official (music )?video", c_title):
+        score -= 4  # music videos often have intros/skits
+    return score, why
+
+
+def _ytmusic_candidates(meta: dict) -> list[dict]:
+    if not _ytm:
+        return []
+    query = f"{' '.join(meta.get('artists') or [])} {meta['title']}".strip()
+    try:
+        results = _ytm.search(query, filter="songs", limit=5)
+    except Exception as e:
+        log.warning("YouTube Music search failed: %s", e)
+        return []
+    out = []
+    for r in results[:5]:
+        if not r.get("videoId"):
+            continue
+        out.append({
+            "url": f"https://music.youtube.com/watch?v={r['videoId']}",
+            "title": r.get("title"),
+            "artists": [a.get("name", "") for a in r.get("artists") or []],
+            "duration": r.get("duration_seconds"),
+            "channel": "",
+            "source": "ytmusic",
+        })
+    return out
+
+
+def _youtube_candidates(meta: dict) -> list[dict]:
+    query = f"{' '.join(meta.get('artists') or [])} - {meta['title']}"
+    opts = {**YDL_BASE, "extract_flat": "in_playlist"}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"ytsearch6:{query}", download=False)
+    except Exception as e:
+        log.warning("YouTube search failed: %s", e)
+        return []
+    out = []
+    for e in (info or {}).get("entries") or []:
+        if not e or not e.get("id"):
+            continue
+        out.append({
+            "url": f"https://www.youtube.com/watch?v={e['id']}",
+            "title": e.get("title"),
+            "artists": [],
+            "duration": e.get("duration"),
+            "channel": e.get("channel") or e.get("uploader") or "",
+            "source": "youtube",
+        })
+    return out
+
+
+def find_best_match(meta: dict) -> str | None:
+    cands = _ytmusic_candidates(meta) + _youtube_candidates(meta)
+    if not cands:
+        return None
+    scored = sorted(((score_candidate(meta, c), c) for c in cands), key=lambda x: x[0][0], reverse=True)
+    (best_score, why), best = scored[0]
+    log.info("Match for %r by %s: %s (score %.0f: %s)", meta["title"], ", ".join(meta.get("artists") or []),
+             best["url"], best_score, ", ".join(why))
+    if best_score < MIN_SCORE:
+        log.warning("Low-confidence match for %r (best score %.0f)", meta["title"], best_score)
+    return best["url"]
 
 
 def _resolve(page_url: str) -> dict:
@@ -358,13 +524,23 @@ async def wait_for_dave(vc: discord.VoiceClient, timeout: float = 8.0) -> bool:
     return dave_ok(vc)
 
 
+async def notice(channel, text: str):
+    """Post a silent (no notification) message that cleans itself up."""
+    if channel is None:
+        return
+    try:
+        await channel.send(text, silent=True, delete_after=NOTICE_TTL or None)
+    except discord.HTTPException as e:
+        log.warning("Couldn't post notice: %s", e)
+
+
 # ---------------------------------------------------------------- bot
 
 class MusicBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
         intents.voice_states = True
-        super().__init__(intents=intents)
+        super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
         self.tree = app_commands.CommandTree(self)
         self.players: dict[int, GuildPlayer] = {}
 
@@ -408,12 +584,17 @@ class MusicBot(discord.Client):
         self.cancel_idle_timer(p)
 
         try:
-            info = await asyncio.to_thread(_resolve, nxt.url)
+            target = nxt.url
+            if nxt.meta:
+                if not nxt.matched:
+                    nxt.matched = await asyncio.to_thread(find_best_match, nxt.meta)
+                target = nxt.matched or nxt.url
+            info = await asyncio.to_thread(_resolve, target)
         except Exception as e:
             log.warning("Failed to resolve %s: %s", nxt.url, e)
             if p.text_channel:
                 reason = str(e).replace("ERROR: ", "").split("\n")[0][:300]
-                await p.text_channel.send(f"⚠️ Couldn't play {nxt.label()} — skipping.\n-# {reason}")
+                await notice(p.text_channel, f"⚠️ Couldn't play {nxt.label()} — skipping.\n-# {reason}")
             p.current = None
             return await self.play_next(guild)
 
@@ -450,12 +631,12 @@ class MusicBot(discord.Client):
             if failed and p.text_channel:
                 last = errors.splitlines()[-1][:300] if errors else "no error output"
                 asyncio.run_coroutine_threadsafe(
-                    p.text_channel.send(f"⚠️ {nxt.label()} stopped after {int(elapsed)}s.\n-# {last}"), self.loop)
+                    notice(p.text_channel, f"⚠️ {nxt.label()} stopped after {int(elapsed)}s.\n-# {last}"), self.loop)
             asyncio.run_coroutine_threadsafe(self.play_next(guild), self.loop)
 
         vc.play(source, after=after)
         if ANNOUNCE and p.text_channel and not (finished is nxt and p.loop == "track"):
-            await p.text_channel.send(f"🎶 Now playing {nxt.label()} — requested by {nxt.requester}")
+            await notice(p.text_channel, f"🎶 Now playing {nxt.label()} — requested by {nxt.requester}")
 
     # ---- idle / auto-disconnect
 
@@ -469,8 +650,6 @@ class MusicBot(discord.Client):
             if vc and not vc.is_playing() and not vc.is_paused():
                 await vc.disconnect()
                 self.players.pop(guild.id, None)
-                if p.text_channel:
-                    await p.text_channel.send("👋 Left the voice channel after being idle.")
 
         p.idle_task = asyncio.create_task(wait_and_leave())
 
@@ -605,7 +784,8 @@ async def play(interaction: discord.Interaction, query: str):
     if not results:
         return await interaction.followup.send("No results.", ephemeral=True)
 
-    tracks = [Track(r["url"], r["title"], r["duration"], interaction.user.display_name, r.get("link"))
+    tracks = [Track(r["url"], r["title"], r["duration"], interaction.user.display_name, r.get("link"),
+                    meta=r.get("meta"))
               for r in results]
     busy = vc.is_playing() or vc.is_paused()
     first_pos = len(p.queue) + 1
@@ -681,23 +861,108 @@ async def stop(interaction: discord.Interaction):
     await interaction.response.send_message("⏹️ Stopped and cleared the queue.", ephemeral=True)
 
 
-@bot.tree.command(description="Show the queue")
+QUEUE_PAGE_SIZE = 15
+
+
+def _short(text: str, n: int = 70) -> str:
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def queue_embed(p: GuildPlayer, page: int) -> tuple[discord.Embed, int, int]:
+    items = list(p.queue)
+    pages = max(1, -(-len(items) // QUEUE_PAGE_SIZE))
+    page = max(0, min(page, pages - 1))
+    lines = []
+    if p.current:
+        lines.append(f"**Now:** {p.current.label()}\n")
+    start = page * QUEUE_PAGE_SIZE
+    for i, t in enumerate(items[start:start + QUEUE_PAGE_SIZE], start=start + 1):
+        lines.append(f"`{i}.` **{_short(t.title)}** `{fmt_time(t.duration)}` — {t.requester}")
+    if not items:
+        lines.append("*Nothing queued after this song.*")
+    total = sum(t.duration or 0 for t in items)
+    embed = discord.Embed(title="Queue", description="\n".join(lines), color=0x5865F2)
+    embed.set_footer(text=f"Page {page + 1}/{pages} • {len(items)} queued • {fmt_time(total)} total"
+                          f" • loop: {p.loop} • vol: {int(p.volume * 100)}%")
+    return embed, page, pages
+
+
+class QueueView(discord.ui.View):
+    """◀ ▶ page buttons (usable by whoever ran /queue) plus a full-list download."""
+
+    def __init__(self, guild_id: int, owner_id: int, page: int):
+        super().__init__(timeout=PUBLIC_TTL or 600)
+        self.guild_id, self.owner_id, self.page = guild_id, owner_id, page
+        self.message: discord.InteractionMessage | None = None
+        self._sync()
+
+    def _sync(self):
+        _, self.page, pages = queue_embed(bot.player(self.guild_id), self.page)
+        self.prev.disabled = self.page == 0
+        self.next.disabled = self.page >= pages - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id and interaction.data.get("custom_id") != "q_full":
+            await interaction.response.send_message("Run /queue yourself to flip pages.", ephemeral=True)
+            return False
+        return True
+
+    async def _show(self, interaction: discord.Interaction):
+        self._sync()
+        embed, _, _ = queue_embed(bot.player(self.guild_id), self.page)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(emoji="◀️", style=discord.ButtonStyle.secondary, custom_id="q_prev")
+    async def prev(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page -= 1
+        await self._show(interaction)
+
+    @discord.ui.button(emoji="▶️", style=discord.ButtonStyle.secondary, custom_id="q_next")
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page += 1
+        await self._show(interaction)
+
+    @discord.ui.button(emoji="🔄", style=discord.ButtonStyle.secondary, custom_id="q_refresh")
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._show(interaction)
+
+    @discord.ui.button(label="Full list", emoji="📄", style=discord.ButtonStyle.secondary, custom_id="q_full")
+    async def full(self, interaction: discord.Interaction, button: discord.ui.Button):
+        p = bot.player(self.guild_id)
+        rows = []
+        if p.current:
+            rows.append(f"Now playing: {p.current.title} [{fmt_time(p.current.duration)}] - {p.current.requester}")
+            rows.append("")
+        for i, t in enumerate(p.queue, start=1):
+            rows.append(f"{i:>4}. {t.title} [{fmt_time(t.duration)}] - {t.requester}")
+        total = sum(t.duration or 0 for t in p.queue)
+        rows += ["", f"{len(p.queue)} songs queued, {fmt_time(total)} total"]
+        import io
+        file = discord.File(io.BytesIO("\n".join(rows).encode("utf-8")), filename="queue.txt")
+        await interaction.response.send_message("Here's the whole queue:", file=file, ephemeral=True)
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass  # message was auto-deleted
+
+
+@bot.tree.command(description="Show the queue (use the buttons to see the whole list)")
+@app_commands.describe(page="Page number to start on")
 @app_commands.guild_only()
-async def queue(interaction: discord.Interaction):
+async def queue(interaction: discord.Interaction, page: app_commands.Range[int, 1] = 1):
     p = bot.player(interaction.guild.id)
     if not p.current and not p.queue:
         return await interaction.response.send_message("The queue is empty.", ephemeral=True)
-    lines = []
-    if p.current:
-        lines.append(f"**Now:** {p.current.label()}")
-    for i, t in enumerate(list(p.queue)[:15], start=1):
-        lines.append(f"`{i}.` {t.label()} — {t.requester}")
-    if len(p.queue) > 15:
-        lines.append(f"…and {len(p.queue) - 15} more")
-    total = sum(t.duration or 0 for t in p.queue)
-    embed = discord.Embed(title="Queue", description="\n".join(lines), color=0x5865F2)
-    embed.set_footer(text=f"{len(p.queue)} queued • {fmt_time(total)} total • loop: {p.loop} • vol: {int(p.volume * 100)}%")
-    await interaction.response.send_message(embed=embed)
+    view = QueueView(interaction.guild.id, interaction.user.id, page - 1)
+    embed, _, _ = queue_embed(p, view.page)
+    await interaction.response.send_message(embed=embed, view=view, silent=True,
+                                            delete_after=PUBLIC_TTL or None)
+    view.message = await interaction.original_response()
 
 
 @bot.tree.command(description="Show the current track")
@@ -706,7 +971,8 @@ async def nowplaying(interaction: discord.Interaction):
     p = bot.player(interaction.guild.id)
     if not p.current:
         return await interaction.response.send_message("Nothing is playing.", ephemeral=True)
-    await interaction.response.send_message(f"🎶 {p.current.label()} — requested by {p.current.requester}\n{p.current.page or p.current.url}")
+    await interaction.response.send_message(f"🎶 {p.current.label()} — requested by {p.current.requester}\n<{p.current.page or p.current.url}>",
+                                            silent=True, delete_after=PUBLIC_TTL or None)
 
 
 @bot.tree.command(description="Set volume (0–150)")
