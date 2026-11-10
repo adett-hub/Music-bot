@@ -45,25 +45,49 @@ YDL_BASE = {
 }
 
 
+def _normalize_cookies(text: str) -> str | None:
+    """Rebuild a Netscape cookies.txt even if tabs were turned into spaces."""
+    lines, count = ["# Netscape HTTP Cookie File"], 0
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = line.strip()
+        if not line or (line.startswith("#") and not line.startswith("#HttpOnly_")):
+            continue
+        parts = line.split("\t") if line.count("\t") >= 6 else line.split(None, 6)
+        if len(parts) == 6:  # cookie with an empty value
+            parts.append("")
+        if len(parts) != 7:
+            continue
+        lines.append("\t".join(p.strip() for p in parts))
+        count += 1
+    return ("\n".join(lines) + "\n", count) if count else (None, 0)
+
+
 def _cookies_from_env() -> str | None:
     """YTDLP_COOKIES_TXT holds the contents of a cookies.txt (plain or base64).
     Written to a private temp file so it never needs to be in the repo."""
-    raw = os.getenv("YTDLP_COOKIES_TXT", "").strip()
+    raw = os.getenv("YTDLP_COOKIES_TXT", "").strip().strip('"').strip("'")
     if not raw:
         return None
-    if "\t" not in raw:  # not plain Netscape format -> try base64
+    candidates = [raw]
+    try:
         import base64
-        try:
-            raw = base64.b64decode(raw).decode("utf-8")
-        except Exception:
-            log.error("YTDLP_COOKIES_TXT is neither a cookies.txt nor base64 of one; ignoring")
-            return None
-    path = "/tmp/yt-cookies.txt"
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(raw.replace("\r\n", "\n") + "\n")
-    os.chmod(path, 0o600)
-    log.info("Loaded YouTube cookies from YTDLP_COOKIES_TXT")
-    return path
+        candidates.insert(0, base64.b64decode("".join(raw.split()), validate=True).decode("utf-8-sig"))
+    except Exception:
+        pass
+    for text in candidates:
+        content, count = _normalize_cookies(text)
+        if content:
+            path = "/tmp/yt-cookies.txt"
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.chmod(path, 0o600)
+            yt = sum(1 for l in content.splitlines() if "youtube.com" in l)
+            log.info("Loaded %d cookies from YTDLP_COOKIES_TXT (%d for youtube.com)", count, yt)
+            if not yt:
+                log.warning("No youtube.com cookies found - export them while on youtube.com")
+            return path
+    log.error("YTDLP_COOKIES_TXT couldn't be read as cookies (starts with %r); ignoring", raw[:20])
+    return None
 
 
 COOKIES_FILE = COOKIES_FILE or _cookies_from_env()
@@ -241,7 +265,8 @@ def _open_audio(info: dict, errlog) -> tuple[subprocess.Popen, str]:
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(info, f)
     cmd = [sys.executable, "-m", "yt_dlp", "--load-info-json", info_path,
-           "-f", "bestaudio/best", "-o", "-", "--quiet", "--no-warnings", "--no-part"]
+           "-f", "bestaudio/best", "-o", "-", "--quiet", "--no-warnings", "--no-part",
+           "--socket-timeout", "15", "--retries", "3", "--http-chunk-size", "10M"]
     if COOKIES_FILE:
         cmd += ["--cookies", COOKIES_FILE]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errlog)
@@ -320,7 +345,8 @@ class MusicBot(discord.Client):
         started = time.monotonic()
 
         def after(err):
-            if proc.poll() is None:
+            rc = proc.poll()  # None = still running (skipped/stopped), nonzero = download failed
+            if rc is None:
                 proc.kill()
             try:
                 os.remove(info_path)
@@ -334,10 +360,11 @@ class MusicBot(discord.Client):
             if errors:
                 log.warning("Stream errors for %s:\n%s", nxt.page, errors[-2000:])
             elapsed = time.monotonic() - started
-            if elapsed < 3 and (nxt.duration or 0) > 10 and p.text_channel:
+            failed = (rc not in (None, 0)) or (elapsed < 3 and (nxt.duration or 0) > 10)
+            if failed and p.text_channel:
                 last = errors.splitlines()[-1][:300] if errors else "no error output"
                 asyncio.run_coroutine_threadsafe(
-                    p.text_channel.send(f"⚠️ {nxt.label()} stopped right away.\n-# {last}"), self.loop)
+                    p.text_channel.send(f"⚠️ {nxt.label()} stopped after {int(elapsed)}s.\n-# {last}"), self.loop)
             asyncio.run_coroutine_threadsafe(self.play_next(guild), self.loop)
 
         vc.play(source, after=after)
