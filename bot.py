@@ -83,8 +83,15 @@ def _cookies_from_env() -> str | None:
             os.chmod(path, 0o600)
             yt = sum(1 for l in content.splitlines() if "youtube.com" in l)
             log.info("Loaded %d cookies from YTDLP_COOKIES_TXT (%d for youtube.com)", count, yt)
+            names = {l.split("\t")[5] for l in content.splitlines()[1:] if l.count("\t") >= 6}
+            login = names & {"SID", "SAPISID", "LOGIN_INFO", "__Secure-3PSID", "__Secure-1PSID"}
             if not yt:
                 log.warning("No youtube.com cookies found - export them while on youtube.com")
+            elif not login:
+                log.warning("Cookies have NO YouTube login (found: %s) - sign in before exporting",
+                            ", ".join(sorted(names))[:300])
+            else:
+                log.info("YouTube login cookies present: %s", ", ".join(sorted(login)))
             return path
     log.error("YTDLP_COOKIES_TXT couldn't be read as cookies (starts with %r); ignoring", raw[:20])
     return None
