@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = os.getenv("GUILD_ID")  # optional: instant command sync to one server
+GUILD_ID = os.getenv("GUILD_ID")  # optional: only used to clean up old server-only commands
 COOKIES_FILE = os.getenv("YTDLP_COOKIES")  # optional: cookies.txt if YouTube blocks the host
 IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "300"))  # seconds before leaving when idle
 MAX_PLAYLIST = int(os.getenv("MAX_PLAYLIST", "100"))
@@ -37,7 +37,7 @@ PUBLIC_TTL = int(os.getenv("PUBLIC_MSG_SECONDS", "120"))  # auto-delete /queue &
 NOTICE_TTL = int(os.getenv("NOTICE_SECONDS", "60"))       # auto-delete error notices (0 = keep)
 LEAD_IN_MS = int(os.getenv("LEAD_IN_MS", "1500"))  # silence before each song so the start isn't clipped  # role name (case-insensitive) or role ID
 
-BOT_VERSION = "2026-11-10c (audio buffer fixes speed-up)"
+BOT_VERSION = "2026-11-15 (works in any server)"
 
 log = logging.getLogger("musicbot")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -615,17 +615,25 @@ class MusicBot(discord.Client):
         self.players: dict[int, GuildPlayer] = {}
 
     async def setup_hook(self):
+        # Always register commands globally so they work in every server the bot joins.
         if GUILD_ID:
+            # Older versions registered a server-only copy here; clear it to avoid duplicate commands.
             guild = discord.Object(id=int(GUILD_ID))
-            self.tree.copy_global_to(guild=guild)
+            self.tree.clear_commands(guild=guild)
             await self.tree.sync(guild=guild)
-            log.info("Commands synced to guild %s", GUILD_ID)
-        else:
-            await self.tree.sync()
-            log.info("Commands synced globally (can take up to an hour to appear)")
+            log.info("Cleared old server-only commands in %s", GUILD_ID)
+        await self.tree.sync()
+        log.info("Commands synced globally - available in every server")
+
+    async def on_guild_join(self, guild: discord.Guild):
+        log.info("Added to server %s (%s) - now in %d servers", guild.name, guild.id, len(self.guilds))
+
+    async def on_guild_remove(self, guild: discord.Guild):
+        self.players.pop(guild.id, None)
+        log.info("Removed from server %s (%s)", guild.name, guild.id)
 
     async def on_ready(self):
-        log.info("Logged in as %s (%s)", self.user, self.user.id)
+        log.info("Logged in as %s (%s), in %d servers", self.user, self.user.id, len(self.guilds))
         await self.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="/play"))
 
     def player(self, guild_id: int) -> GuildPlayer:
