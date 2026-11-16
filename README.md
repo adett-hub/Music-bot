@@ -34,13 +34,19 @@ pip install -r requirements.txt
 copy .env.example .env            # then paste your token into .env
 python bot.py
 ```
-Tip: put your server ID in `GUILD_ID` (right-click server → Copy Server ID, with Developer Mode on) so commands show up instantly instead of taking up to an hour.
+Slash commands are registered globally, so they work in every server the bot is added to.
 
 ## 3. Host 24/7 on Railway
-Push to GitHub, create a Railway service from the repo — it builds from the `Dockerfile` (FFmpeg + Deno included). Add `DISCORD_TOKEN` (and optionally `GUILD_ID`) under **Variables**.
+Push to GitHub, create a Railway service from the repo — it builds from the `Dockerfile` (FFmpeg + Deno included). Add `DISCORD_TOKEN` under **Variables**.
 
 ### If YouTube says "Sign in to confirm you're not a bot"
-YouTube often blocks cloud server IPs. Export your browser's YouTube cookies to `cookies.txt` (e.g. with a "Get cookies.txt LOCALLY" extension), add it to the deployment, and set `YTDLP_COOKIES=cookies.txt`. Using a throwaway Google account for this is wise. SoundCloud links are usually unaffected.
+YouTube often blocks cloud server IPs. Give the bot cookies from a **spare** Google account:
+1. Open a private/incognito window, sign in to YouTube with the spare account, and export cookies with a "Get cookies.txt LOCALLY" extension (allow it in incognito). Then close the private window, which keeps those cookies from changing.
+2. In PowerShell, copy the file as base64:
+   `[Convert]::ToBase64String([IO.File]::ReadAllBytes("$HOME\Downloads\cookies.txt")) | Set-Clipboard`
+3. In Railway → Variables, add `YTDLP_COOKIES_TXT` and paste. Delete the cookies.txt file afterwards, and never commit it.
+
+SoundCloud links are usually unaffected.
 
 ## Keeping it working
 YouTube changes things often; when playback suddenly breaks, update yt-dlp first:
