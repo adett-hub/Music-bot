@@ -37,7 +37,7 @@ PUBLIC_TTL = int(os.getenv("PUBLIC_MSG_SECONDS", "120"))  # auto-delete /queue &
 NOTICE_TTL = int(os.getenv("NOTICE_SECONDS", "60"))       # auto-delete error notices (0 = keep)
 LEAD_IN_MS = int(os.getenv("LEAD_IN_MS", "1500"))  # silence before each song so the start isn't clipped  # role name (case-insensitive) or role ID
 
-BOT_VERSION = "2026-11-15 (works in any server)"
+BOT_VERSION = "2026-11-19b (/playnext, /skip count)"
 
 log = logging.getLogger("musicbot")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -840,11 +840,8 @@ async def require_vc(interaction: discord.Interaction) -> discord.VoiceClient | 
 
 # ---------------------------------------------------------------- commands
 
-@bot.tree.command(description="Play a song or playlist (YouTube/Spotify/SoundCloud link or search terms)")
-@app_commands.describe(query="URL or search terms")
-@app_commands.guild_only()
-@dj_only()
-async def play(interaction: discord.Interaction, query: str):
+async def enqueue(interaction: discord.Interaction, query: str, front: bool = False):
+    """Shared by /play (adds to the end) and /playnext (adds right after the current song)."""
     await interaction.response.defer(thinking=True, ephemeral=True)
     vc = await ensure_voice(interaction)
     if vc is None:
@@ -872,28 +869,51 @@ async def play(interaction: discord.Interaction, query: str):
                     meta=r.get("meta"))
               for r in results]
     busy = vc.is_playing() or vc.is_paused()
-    first_pos = len(p.queue) + 1
-    p.queue.extend(tracks)
-    last_pos = len(p.queue)
-
-    if len(tracks) == 1:
-        msg = (f"➕ Queued {tracks[0].label()} — **#{first_pos}** in queue" if busy
-               else f"▶️ Starting {tracks[0].label()}")
-    elif busy:
-        msg = (f"➕ Queued **{len(tracks)}** tracks" + (" from Spotify (played via YouTube)" if spotify else "")
-               + f" — positions **#{first_pos}–#{last_pos}**")
+    if front:
+        p.queue.extendleft(reversed(tracks))  # keeps playlist order, all ahead of the rest
+        first_pos, last_pos = 1, len(tracks)
     else:
-        msg = f"➕ Queued **{len(tracks)}** tracks" + (" from Spotify (played via YouTube)." if spotify else " from the playlist.")
+        first_pos = len(p.queue) + 1
+        p.queue.extend(tracks)
+        last_pos = len(p.queue)
+
+    source = " from Spotify (played via YouTube)" if spotify else ""
+    if not busy:
+        msg = (f"▶️ Starting {tracks[0].label()}" if len(tracks) == 1
+               else f"➕ Queued **{len(tracks)}** tracks{source or ' from the playlist'}.")
+    elif front:
+        msg = (f"⏭️ Up next: {tracks[0].label()} — **#1** in queue" if len(tracks) == 1
+               else f"⏭️ Up next: **{len(tracks)}** tracks{source} — positions **#1–#{last_pos}**")
+    else:
+        msg = (f"➕ Queued {tracks[0].label()} — **#{first_pos}** in queue" if len(tracks) == 1
+               else f"➕ Queued **{len(tracks)}** tracks{source} — positions **#{first_pos}–#{last_pos}**")
     await interaction.followup.send(msg, ephemeral=True)
 
     if not vc.is_playing() and not vc.is_paused():
         await bot.play_next(interaction.guild)
 
 
-@bot.tree.command(description="Skip the current track")
+@bot.tree.command(description="Play a song or playlist (YouTube/Spotify/SoundCloud link or search terms)")
+@app_commands.describe(query="URL or search terms")
 @app_commands.guild_only()
 @dj_only()
-async def skip(interaction: discord.Interaction):
+async def play(interaction: discord.Interaction, query: str):
+    await enqueue(interaction, query)
+
+
+@bot.tree.command(description="Play a song or playlist right after the current song")
+@app_commands.describe(query="URL or search terms")
+@app_commands.guild_only()
+@dj_only()
+async def playnext(interaction: discord.Interaction, query: str):
+    await enqueue(interaction, query, front=True)
+
+
+@bot.tree.command(description="Skip the current song, or several songs at once")
+@app_commands.describe(count="How many songs to skip, counting the current one (default 1)")
+@app_commands.guild_only()
+@dj_only()
+async def skip(interaction: discord.Interaction, count: app_commands.Range[int, 1] = 1):
     vc = await require_vc(interaction)
     if not vc:
         return
@@ -902,8 +922,25 @@ async def skip(interaction: discord.Interaction):
     p = bot.player(interaction.guild.id)
     if p.loop == "track":
         p.loop = "off"  # skipping should actually move on
+
+    extra = min(count - 1, len(p.queue))  # songs removed from the queue besides the current one
+    removed = [p.queue.popleft() for _ in range(extra)]
+    if p.loop == "queue":
+        # keep the loop's order: current song, then the skipped ones, go to the back
+        if p.current:
+            p.queue.append(p.current)
+            p.current = None  # so play_next doesn't add it again
+        p.queue.extend(removed)
+
+    skipped = 1 + extra
+    up_next = p.queue[0].label() if p.queue else None
     vc.stop()  # triggers `after` -> play_next
-    await interaction.response.send_message("⏭️ Skipped.", ephemeral=True)
+
+    msg = "⏭️ Skipped." if skipped == 1 else f"⏭️ Skipped **{skipped}** songs."
+    if count > skipped:
+        msg += f" (Only {skipped} were left.)"
+    msg += f" Up next: {up_next}" if up_next else " The queue is now empty."
+    await interaction.response.send_message(msg, ephemeral=True)
 
 
 @bot.tree.command(description="Pause playback")
